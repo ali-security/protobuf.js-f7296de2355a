@@ -5,6 +5,8 @@ var path = require("path");
 var Module = require("module");
 var protobuf = require("..");
 var fs = require("fs");
+var EventEmitter = require("events").EventEmitter;
+var child_process = require("child_process");
 
 function cliTest(test, testFunc) {
     // pbjs does not seem to work with Node v4, so skip this test if we're running on it
@@ -88,6 +90,79 @@ tape.test("pbjs generates static code", function(test) {
             test.equal(defaultTypeUrl, "type.googleapis.com/Message", "getTypeUrl returns expected url");
             test.equal(customTypeUrl, "example.com/Message", "getTypeUrl returns custom url");
 
+            test.end();
+        });
+    });
+});
+
+// Loads cli/pbts even if cli-only dependencies (i.e. tmp) are not installed in the root package,
+// stubbing any module that cannot be resolved with a harmless built-in module.
+function loadPbts() {
+    var savedResolveFilename = Module._resolveFilename;
+    Module._resolveFilename = function(request, parent) {
+        try {
+            return savedResolveFilename.apply(this, arguments);
+        } catch (err) {
+            if (err && err.code === "MODULE_NOT_FOUND" && parent && parent.filename && parent.filename.indexOf(path.join(__dirname, "..", "cli")) === 0)
+                return "path";
+            throw err;
+        }
+    };
+    try {
+        return require("../cli/pbts");
+    } finally {
+        Module._resolveFilename = savedResolveFilename;
+    }
+}
+
+tape.test("pbts passes jsdoc arguments without a shell", function(test) {
+    var pbts = loadPbts();
+    var originalSpawn = child_process.spawn;
+    var file = "file with \"quotes\" `backticks` 'apostrophes' and ;.js";
+
+    test.plan(5);
+
+    child_process.spawn = function(cmd, args, options) {
+        var child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = { pipe: function() {} };
+
+        test.equal(cmd, process.execPath, "should execute node directly");
+        test.ok(/jsdoc[\\/]jsdoc\.js$/.test(args[0]), "should execute jsdoc directly");
+        test.equal(args[args.length - 1], file, "should pass file path as a single argument");
+        test.equal(options.stdio, "pipe", "should pipe jsdoc output");
+
+        process.nextTick(function() {
+            child.stdout.emit("data", "declare namespace test {}\n");
+            child.stdout.emit("end");
+            child.emit("close", 0);
+        });
+
+        return child;
+    };
+
+    pbts.main([file], function(err) {
+        child_process.spawn = originalSpawn;
+        test.error(err, "should generate definitions");
+    });
+});
+
+tape.test("pbjs escapes static target names", function(test) {
+    cliTest(test, function() {
+        var root = protobuf.Root.fromJSON({
+            nested: {
+                "1-ns": {
+                    nested: {}
+                }
+            }
+        });
+        var staticTarget = require("../cli/targets/static");
+
+        staticTarget(root, {}, function(err, jsCode) {
+            test.error(err, "static code generation worked");
+            test.doesNotThrow(function() {
+                new Function("$protobuf", jsCode); // eslint-disable-line no-new-func
+            }, "should generate parseable output");
             test.end();
         });
     });
